@@ -53,6 +53,29 @@ class RFSNv10KVCacheMLX:
         self.num_cold = 0
         self.total_tokens = 0
         self.quantizer: Optional[HybridQuantizerMLX] = None
+        self.last_access_stats = self._empty_access_stats()
+
+    def _empty_access_stats(self) -> Dict[str, int]:
+        return {
+            "window_start": 0,
+            "window_end": 0,
+            "window_tokens": 0,
+            "context_window": -1,
+            "query_tokens": 0,
+            "used_router": 0,
+            "hot_tokens_materialized": 0,
+            "warm_tokens_materialized": 0,
+            "cold_tokens_materialized": 0,
+            "reconstructed_tokens": 0,
+            "warm_chunk_decodes": 0,
+            "cold_chunk_decodes": 0,
+            "cold_chunks_touched": 0,
+            "cold_chunk_cache_hits": 0,
+            "cold_chunk_cache_misses": 0,
+        }
+
+    def get_last_access_stats(self) -> Dict[str, int]:
+        return dict(self.last_access_stats)
 
     @property
     def current_tier(self) -> str:
@@ -185,14 +208,25 @@ class RFSNv10KVCacheMLX:
             return None
         return overlap_start, overlap_end
 
-    def _hot_window_exact(self, start: int, end: int) -> Tuple[List[mx.array], List[mx.array]]:
+    def _hot_window_exact(
+        self,
+        start: int,
+        end: int,
+        stats: Dict[str, int],
+    ) -> Tuple[List[mx.array], List[mx.array]]:
         overlap = self._overlap(start, end, 0, self.num_hot)
         if overlap is None:
             return [], []
         overlap_start, overlap_end = overlap
+        stats["hot_tokens_materialized"] += overlap_end - overlap_start
         return [self.hot_keys[overlap_start:overlap_end]], [self.hot_values[overlap_start:overlap_end]]
 
-    def _warm_window_exact(self, start: int, end: int) -> Tuple[List[mx.array], List[mx.array]]:
+    def _warm_window_exact(
+        self,
+        start: int,
+        end: int,
+        stats: Dict[str, int],
+    ) -> Tuple[List[mx.array], List[mx.array]]:
         warm_start_global = self.num_hot
         warm_end_global = self.num_hot + self.num_warm
         overlap = self._overlap(start, end, warm_start_global, warm_end_global)
@@ -207,16 +241,21 @@ class RFSNv10KVCacheMLX:
         chunk_tokens = max(1, self.config.block_size_seq)
         for chunk_start in range(local_start, local_end, chunk_tokens):
             chunk_end = min(chunk_start + chunk_tokens, local_end)
+            chunk_len = chunk_end - chunk_start
             key_store = _slice_compressed_tensor(self.warm_keys, chunk_start, chunk_end)
             value_store = _slice_compressed_tensor(self.warm_values, chunk_start, chunk_end)
             key_chunks.append(_decode_compressed_tensor(key_store, self.quantizer))
             value_chunks.append(_decode_compressed_tensor(value_store, self.quantizer))
+            stats["warm_tokens_materialized"] += chunk_len
+            stats["reconstructed_tokens"] += chunk_len
+            stats["warm_chunk_decodes"] += 1
         return key_chunks, value_chunks
 
     def _cold_window_exact(
         self,
         start: int,
         end: int,
+        stats: Dict[str, int],
         router: Optional[AsyncHierarchicalRouterMLX] = None,
         current_position: Optional[int] = None,
         context_window: Optional[int] = None,
@@ -238,13 +277,22 @@ class RFSNv10KVCacheMLX:
             loaded = router.get_chunk(chunk_id) if router is not None else None
             if loaded is None:
                 loaded = self.load_cold_chunk(chunk_id)
+                if router is not None:
+                    stats["cold_chunk_cache_misses"] += 1
+            else:
+                stats["cold_chunk_cache_hits"] += 1
 
             local_start = overlap[0] - metadata["start_token"]
             local_end = overlap[1] - metadata["start_token"]
+            token_count = local_end - local_start
             key_store = _slice_compressed_tensor(self._chunk_store(loaded, "key"), local_start, local_end)
             value_store = _slice_compressed_tensor(self._chunk_store(loaded, "value"), local_start, local_end)
             cold_keys.append(_decode_compressed_tensor(key_store, self.quantizer))
             cold_values.append(_decode_compressed_tensor(value_store, self.quantizer))
+            stats["cold_tokens_materialized"] += token_count
+            stats["reconstructed_tokens"] += token_count
+            stats["cold_chunk_decodes"] += 1
+            stats["cold_chunks_touched"] += 1
 
         return cold_keys, cold_values
 
@@ -263,14 +311,21 @@ class RFSNv10KVCacheMLX:
             context_window=context_window,
             current_position=current_position,
         )
+        stats = self._empty_access_stats()
+        stats["window_start"] = window_start
+        stats["window_end"] = window_end
+        stats["window_tokens"] = max(0, window_end - window_start)
+        stats["context_window"] = -1 if context_window is None else context_window
+        stats["used_router"] = int(router is not None)
 
         key_segments: List[mx.array] = []
         value_segments: List[mx.array] = []
-        hot_keys, hot_values = self._hot_window_exact(window_start, window_end)
-        warm_keys, warm_values = self._warm_window_exact(window_start, window_end)
+        hot_keys, hot_values = self._hot_window_exact(window_start, window_end, stats)
+        warm_keys, warm_values = self._warm_window_exact(window_start, window_end, stats)
         cold_keys, cold_values = self._cold_window_exact(
             window_start,
             window_end,
+            stats,
             router=router,
             current_position=current_position,
             context_window=context_window,
@@ -284,10 +339,12 @@ class RFSNv10KVCacheMLX:
 
         if not key_segments:
             empty = mx.zeros((0, self.config.num_heads, self.config.head_dim), dtype=mx.float16)
+            self.last_access_stats = dict(stats)
             return empty, empty, adjusted_positions
 
         keys = key_segments[0] if len(key_segments) == 1 else mx.concatenate(key_segments, axis=0)
         values = value_segments[0] if len(value_segments) == 1 else mx.concatenate(value_segments, axis=0)
+        self.last_access_stats = dict(stats)
         return keys, values, adjusted_positions
 
     def attention_forward(
@@ -311,6 +368,7 @@ class RFSNv10KVCacheMLX:
             router=router,
             current_position=current_position,
         )
+        self.last_access_stats["query_tokens"] = int(q.shape[0])
         if int(keys.shape[0]) == 0:
             return mx.zeros_like(q)
 

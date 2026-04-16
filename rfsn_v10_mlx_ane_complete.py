@@ -297,6 +297,7 @@ def run_benchmarks() -> List[Dict[str, object]]:
             mean_ms = ((time.perf_counter() - start) * 1000.0) / scenario["iterations"]
 
             mem = cache.memory_usage_bytes()
+            access_stats = cache.get_last_access_stats()
             cold_disk_bytes = sum(path.stat().st_size for path in cache.cold_chunk_paths if path.exists())
             result = {
                 "scenario": scenario["name"],
@@ -310,10 +311,14 @@ def run_benchmarks() -> List[Dict[str, object]]:
                 "cold_tokens": mem["cold_tokens"],
                 "cold_chunks": mem["cold_chunks"],
                 "cold_disk_bytes": cold_disk_bytes,
+                "window_tokens": access_stats["window_tokens"],
+                "reconstructed_tokens": access_stats["reconstructed_tokens"],
+                "warm_chunk_decodes": access_stats["warm_chunk_decodes"],
+                "cold_chunk_decodes": access_stats["cold_chunk_decodes"],
             }
             results.append(result)
             logger.info(
-                "[Bench] %-10s tokens=%d window=%d mean=%.3fms hot=%.1fKB warm=%.1fKB cold_disk=%.1fKB",
+                "[Bench] %-10s tokens=%d window=%d mean=%.3fms hot=%.1fKB warm=%.1fKB cold_disk=%.1fKB recon=%d warm_decodes=%d cold_decodes=%d",
                 result["scenario"],
                 result["tokens"],
                 result["context_window"],
@@ -321,6 +326,9 @@ def run_benchmarks() -> List[Dict[str, object]]:
                 result["hot_bytes"] / 1024.0,
                 (result["warm_pq_bytes"] + result["warm_rvq_bytes"]) / 1024.0,
                 result["cold_disk_bytes"] / 1024.0,
+                result["reconstructed_tokens"],
+                result["warm_chunk_decodes"],
+                result["cold_chunk_decodes"],
             )
     finally:
         if benchmark_root.exists():
@@ -454,6 +462,7 @@ def run_tests() -> bool:
             causal=True,
             query_positions=mx.array([59], dtype=mx.int32),
         )
+        access_stats = cache.get_last_access_stats()
 
         keys_exact, values_exact, adjusted_positions = cache.materialize_window(
             query_positions=mx.array([59], dtype=mx.int32),
@@ -471,6 +480,13 @@ def run_tests() -> bool:
         assert max_diff < 1e-4
         mem = cache.memory_usage_bytes()
         assert mem["cold_chunks"] == 1
+        assert access_stats["window_tokens"] == 60
+        assert access_stats["hot_tokens_materialized"] == config.hot_capacity
+        assert access_stats["warm_tokens_materialized"] == config.warm_capacity
+        assert access_stats["cold_tokens_materialized"] == 60 - config.hot_capacity - config.warm_capacity
+        assert access_stats["reconstructed_tokens"] == access_stats["warm_tokens_materialized"] + access_stats["cold_tokens_materialized"]
+        assert access_stats["warm_chunk_decodes"] == 2
+        assert access_stats["cold_chunk_decodes"] == 1
         logger.info("  Cache tiering validated, attention max diff: %.2e", max_diff)
 
     def test_warm_window_materialization() -> None:
@@ -488,6 +504,7 @@ def run_tests() -> bool:
             query_positions=mx.array([35], dtype=mx.int32),
             context_window=8,
         )
+        access_stats = cache.get_last_access_stats()
         assert window_keys.shape == (8, config.num_heads, config.head_dim)
         assert window_values.shape == (8, config.num_heads, config.head_dim)
         assert int(np.asarray(adjusted)[0]) == 7
@@ -495,6 +512,12 @@ def run_tests() -> bool:
         max_value_diff = float(mx.max(mx.abs(window_values.astype(mx.float32) - full_values[-8:].astype(mx.float32))))
         assert max_key_diff < 1e-4
         assert max_value_diff < 1e-4
+        assert access_stats["window_tokens"] == 8
+        assert access_stats["hot_tokens_materialized"] == 0
+        assert access_stats["warm_tokens_materialized"] == 8
+        assert access_stats["cold_tokens_materialized"] == 0
+        assert access_stats["reconstructed_tokens"] == 8
+        assert access_stats["warm_chunk_decodes"] == 1
         logger.info("  Warm-tier window materialization validated")
 
     def test_calibration() -> None:
