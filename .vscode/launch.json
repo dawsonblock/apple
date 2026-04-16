@@ -6,8 +6,8 @@
       "type": "lldb",
       "request": "launch",
       "args": [],
-      "cwd": "/Users/dawsonblock/Downloads/apple",
-      "program": "/Users/dawsonblock/Downloads/apple/build/Debug/outDebug"
+      "cwd": "/Users/dawsonblock/Downloads/apple/__pycache__",
+      "program": "/Users/dawsonblock/Downloads/apple/__pycache__/build/Debug/outDebug"
     }
   ]
 }
