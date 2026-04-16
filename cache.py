@@ -46,6 +46,7 @@ class RFSNv10KVCacheMLX:
         self.warm_values = CompressedTensorMLX.empty(config)
 
         self.cold_chunk_paths: List[Path] = []
+        self.cold_chunk_paths_by_id: Dict[int, Path] = {}
         self.cold_chunk_metadata: List[dict] = []
 
         self.num_hot = 0
@@ -140,28 +141,36 @@ class RFSNv10KVCacheMLX:
         disk_root = Path(self.config.disk_cache_dir) if disk_dir is None else disk_dir
         disk_root.mkdir(parents=True, exist_ok=True)
 
-        compressed_keys = _compress_tensor_sequence(keys, quantizer)
-        compressed_values = _compress_tensor_sequence(values, quantizer)
-
-        chunk_id = len(self.cold_chunk_paths)
-        chunk_path = chunk_file_path(disk_root, self.layer_idx, chunk_id)
+        chunk_tokens = max(1, self.config.block_size_seq)
         start_token = self.num_hot + self.num_warm + self.num_cold
-        save_compressed_chunk(chunk_path, compressed_keys, compressed_values)
+        for offset in range(0, int(keys.shape[0]), chunk_tokens):
+            end = min(offset + chunk_tokens, int(keys.shape[0]))
+            chunk_keys = keys[offset:end]
+            chunk_values = values[offset:end]
+            chunk_start_token = start_token + offset
+            chunk_id = chunk_start_token // chunk_tokens
+            chunk_path = chunk_file_path(disk_root, self.layer_idx, chunk_id)
 
-        self.cold_chunk_paths.append(chunk_path)
-        self.cold_chunk_metadata.append(
-            {
-                "chunk_id": chunk_id,
-                "start_token": start_token,
-                "end_token": start_token + int(keys.shape[0]),
-                "num_tokens": int(keys.shape[0]),
-                "path": str(chunk_path),
-            }
-        )
+            compressed_keys = _compress_tensor_sequence(chunk_keys, quantizer)
+            compressed_values = _compress_tensor_sequence(chunk_values, quantizer)
+            save_compressed_chunk(chunk_path, compressed_keys, compressed_values)
+
+            self.cold_chunk_paths.append(chunk_path)
+            self.cold_chunk_paths_by_id[chunk_id] = chunk_path
+            self.cold_chunk_metadata.append(
+                {
+                    "chunk_id": chunk_id,
+                    "start_token": chunk_start_token,
+                    "end_token": chunk_start_token + int(chunk_keys.shape[0]),
+                    "num_tokens": int(chunk_keys.shape[0]),
+                    "path": str(chunk_path),
+                }
+            )
+
         self.num_cold += int(keys.shape[0])
 
     def load_cold_chunk(self, chunk_id: int) -> Dict[str, mx.array]:
-        return load_compressed_chunk(self.cold_chunk_paths[chunk_id])
+        return load_compressed_chunk(self.cold_chunk_paths_by_id[chunk_id])
 
     def _chunk_store(self, loaded: Dict[str, mx.array], prefix: str) -> CompressedTensorMLX:
         return compressed_tensor_from_loaded(loaded, prefix)
@@ -264,7 +273,13 @@ class RFSNv10KVCacheMLX:
             return [], []
 
         if router is not None and current_position is not None and context_window is not None:
-            router.prefetch_sync(current_position=current_position, context_window=context_window)
+            chunk_tokens = max(1, self.config.block_size_seq)
+            prefetch_top_k = max(1, (context_window + chunk_tokens - 1) // chunk_tokens)
+            router.prefetch_sync(
+                current_position=current_position,
+                context_window=context_window,
+                top_k=prefetch_top_k,
+            )
 
         cold_keys: List[mx.array] = []
         cold_values: List[mx.array] = []

@@ -152,7 +152,8 @@ def _evaluate_mode(
 
     current_position = int(np.max(np.asarray(query_positions, dtype=np.int64)))
     router_enabled = use_router and context_window is not None and cache.num_cold > 0
-    router = AsyncHierarchicalRouterMLX(config, layer_idx=0) if router_enabled else None
+    router_config = replace(config, disk_cache_dir=str(cache_dir))
+    router = AsyncHierarchicalRouterMLX(router_config, layer_idx=0) if router_enabled else None
 
     dense_keys, dense_values, adjusted_positions = _materialize_dense_window(
         keys,

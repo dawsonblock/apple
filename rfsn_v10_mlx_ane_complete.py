@@ -454,7 +454,7 @@ def run_tests() -> bool:
         assert cache.num_hot == config.hot_capacity
         assert cache.num_warm == config.warm_capacity
         assert cache.num_cold == 60 - config.hot_capacity - config.warm_capacity
-        assert len(cache.cold_chunk_paths) == 1
+        assert len(cache.cold_chunk_paths) == 2
 
         q = mx.random.normal(shape=(1, config.num_heads, config.head_dim), dtype=mx.float32).astype(mx.float16)
         cache_out = cache.attention_forward(
@@ -479,14 +479,14 @@ def run_tests() -> bool:
         max_diff = float(mx.max(mx.abs(cache_out.astype(mx.float32) - ref.astype(mx.float32))))
         assert max_diff < 1e-4
         mem = cache.memory_usage_bytes()
-        assert mem["cold_chunks"] == 1
+        assert mem["cold_chunks"] == 2
         assert access_stats["window_tokens"] == 60
         assert access_stats["hot_tokens_materialized"] == config.hot_capacity
         assert access_stats["warm_tokens_materialized"] == config.warm_capacity
         assert access_stats["cold_tokens_materialized"] == 60 - config.hot_capacity - config.warm_capacity
         assert access_stats["reconstructed_tokens"] == access_stats["warm_tokens_materialized"] + access_stats["cold_tokens_materialized"]
         assert access_stats["warm_chunk_decodes"] == 2
-        assert access_stats["cold_chunk_decodes"] == 1
+        assert access_stats["cold_chunk_decodes"] == 2
         logger.info("  Cache tiering validated, attention max diff: %.2e", max_diff)
 
     def test_warm_window_materialization() -> None:
@@ -540,6 +540,17 @@ def run_tests() -> bool:
         loaded_ids = router.prefetch_sync(current_position=0, context_window=1024, top_k=1)
         assert loaded_ids
         assert router.get_chunk(loaded_ids[0]) is not None
+        q = mx.random.normal(shape=(1, config.num_heads, config.head_dim), dtype=mx.float32).astype(mx.float16)
+        _ = cache.attention_forward(
+            q,
+            causal=True,
+            query_positions=mx.array([47], dtype=mx.int32),
+            router=router,
+            current_position=47,
+            context_window=16,
+        )
+        access_stats = cache.get_last_access_stats()
+        assert access_stats["cold_chunk_cache_hits"] >= 1
         logger.info("  Router prefetched chunks: %s", loaded_ids)
 
     def test_decoder_layer_api() -> None:
