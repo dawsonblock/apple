@@ -22,6 +22,7 @@ The current implementation is intentionally honest about those tradeoffs. It run
 - [Repository Layout](#repository-layout)
 - [Getting Started](#getting-started)
 - [Run Commands](#run-commands)
+- [Optional Llama 3.2 Adapter](#optional-llama-32-adapter)
 - [Benchmark Outputs](#benchmark-outputs)
 - [Design Notes](#design-notes)
 - [Limitations](#limitations)
@@ -105,6 +106,10 @@ flowchart LR
 | [attention.py](attention.py) | Exact blockwise attention and compressed store attention wrapper |
 | [storage.py](storage.py) | Shared config, chunk IO helpers, compressed tensor containers, async router |
 | [requirements.txt](requirements.txt) | Pinned versions used to validate this repo |
+| [requirements-models-optional.txt](requirements-models-optional.txt) | Optional Hugging Face model dependencies for Llama layer tests |
+| [llama32_adapter.py](llama32_adapter.py) | Optional Llama 3.2 layer adapter and Hugging Face tracing helpers |
+| [rfsn_v10_llama32_smoke_test.py](rfsn_v10_llama32_smoke_test.py) | Optional prompt-to-generation Llama layer smoke test |
+| [rfsn_v10_llama32_benchmark.py](rfsn_v10_llama32_benchmark.py) | Optional real-prompt layer benchmark CSV harness |
 | [benchmark_outputs](benchmark_outputs) | Generated CSV benchmark artifacts |
 
 ## Getting Started
@@ -131,6 +136,22 @@ python3 -m pip install -r requirements.txt
 ```
 
 If you prefer pyenv, the repo has already been validated with Python 3.9.7 on Apple Silicon.
+
+Recommended: keep the optional model-backed tooling in a separate environment so the base MLX research path is isolated from Hugging Face package churn.
+
+```bash
+python3 -m venv .venv-models
+source .venv-models/bin/activate
+python3 -m pip install --upgrade pip
+python3 -m pip install -r requirements.txt
+python3 -m pip install -r requirements-models-optional.txt
+```
+
+If you reuse the base environment instead, install the optional model-backed adapter tooling with:
+
+```bash
+python3 -m pip install -r requirements-models-optional.txt
+```
 
 ## Run Commands
 
@@ -203,6 +224,66 @@ python3 rfsn_v10_eval_benchmark.py \
   --output benchmark_outputs/dense_vs_hot_warm_router.csv
 ```
 
+## Optional Llama 3.2 Adapter
+
+The optional Llama path is intentionally narrow in scope.
+
+- It loads a real Hugging Face Llama 3.2 checkpoint.
+- It captures one selected decoder layer's real input and output activations.
+- It rebuilds that layer in MLX on top of this repo's cache and quantizer stack.
+- It compares dense MLX execution and cache-backed single-token decode against the real Hugging Face layer output.
+
+What it does not do:
+
+- It does not replace the full Hugging Face model with an MLX end-to-end implementation.
+- It does not claim whole-model serving parity.
+- It does not bypass Meta's model license or Hugging Face authentication requirements.
+
+Before first use, accept the model license on Hugging Face and authenticate locally if the checkpoint requires it.
+
+Recommended workflow for model-backed runs:
+
+```bash
+source .venv-models/bin/activate
+```
+
+This keeps the optional `transformers` and `huggingface-hub` pins away from other Python packages that may want newer versions.
+
+### 6. Run the Llama layer smoke test
+
+```bash
+python3 rfsn_v10_llama32_smoke_test.py \
+  --model-id meta-llama/Llama-3.2-1B-Instruct \
+  --layer-index 0 \
+  --max-new-tokens 16
+```
+
+### 7. Run the Llama layer benchmark harness
+
+```bash
+python3 rfsn_v10_llama32_benchmark.py \
+  --model-id meta-llama/Llama-3.2-1B-Instruct \
+  --layer-index 0 \
+  --max-new-tokens 16 \
+  --output benchmark_outputs/llama32_layer_benchmark.csv
+```
+
+If Meta access is not yet approved for your Hugging Face account, an open Llama-family fallback that exercises the same code path is:
+
+```bash
+python3 rfsn_v10_llama32_smoke_test.py \
+  --model-id TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --layer-index 0 \
+  --max-new-tokens 16 \
+  --output benchmark_outputs/tinyllama_smoke_test.json
+
+python3 rfsn_v10_llama32_benchmark.py \
+  --model-id TinyLlama/TinyLlama-1.1B-Chat-v1.0 \
+  --layer-index 0 \
+  --max-new-tokens 16 \
+  --output benchmark_outputs/tinyllama_layer_benchmark.csv
+```
+
 ## Benchmark Outputs
 
 Generated CSV artifacts live in [benchmark_outputs](benchmark_outputs).
@@ -211,6 +292,8 @@ Important files:
 
 - [benchmark_outputs/dense_vs_hot_warm.csv](benchmark_outputs/dense_vs_hot_warm.csv)
 - [benchmark_outputs/dense_vs_hot_warm_router.csv](benchmark_outputs/dense_vs_hot_warm_router.csv)
+- [benchmark_outputs/tinyllama_smoke_test.json](benchmark_outputs/tinyllama_smoke_test.json)
+- [benchmark_outputs/tinyllama_layer_benchmark.csv](benchmark_outputs/tinyllama_layer_benchmark.csv)
 
 ### What The Columns Mean
 
@@ -296,9 +379,11 @@ print(decoded.shape)
 ## Limitations
 
 - The repository does not load or serve a real frontier model checkpoint.
+- Optional Llama support is layer-level parity and prompt-derived benchmarking only, not end-to-end model replacement.
 - The decoder layer API is a synthetic but useful systems wrapper, not a drop in replacement for a complete transformer stack.
 - Current latency numbers are dominated by reconstruction cost once the compressed path is engaged.
 - The benchmark harness is synthetic and not tied to any one production prompt distribution.
+- Meta Llama checkpoints may require license acceptance and local Hugging Face authentication before they can be downloaded.
 - The cold router is now functionally aligned, but its prediction strategy is still simple and can be improved.
 
 ## Roadmap Ideas
@@ -307,7 +392,7 @@ print(decoded.shape)
 - Better warm tier scheduling to reduce decode fanout for wide windows.
 - Smarter RVQ gating so drift reduction is concentrated where it matters most.
 - More realistic workload traces and prompt distributions.
-- Integration with a real model block stack and checkpoint adapters.
+- Broader checkpoint adapters beyond the current optional Llama layer bridge.
 
 ## Reproducibility Notes
 
