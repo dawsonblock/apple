@@ -3,28 +3,27 @@ from __future__ import annotations
 """
 RFSN v10.2 - Dense vs hot+warm evaluation benchmark.
 
-This script compares exact dense attention against the current hot+warm cache
-path on synthetic long sequences. It reports latency, memory estimates, and
-output drift, then writes a CSV for further analysis.
+This script compares exact dense attention against the hot+warm cache path on
+synthetic long sequences. It evaluates both PQ-only and PQ+RVQ modes using the
+same synthetic inputs per sequence length, reports latency and memory, measures
+output drift, and writes a CSV.
 """
 
 import argparse
 import csv
 import logging
 import time
+from dataclasses import replace
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import numpy as np
 
-from rfsn_v10_mlx_ane_complete import (
-    RFSNConfig,
-    HybridQuantizerMLX,
-    RFSNv10KVCacheMLX,
-    _blockwise_exact_attention,
-    _decode_compressed_tensor,
-)
+from attention import _blockwise_exact_attention
+from cache import RFSNv10KVCacheMLX
+from quantization import HybridQuantizerMLX
+from storage import RFSNConfig
 
 
 logging.basicConfig(
@@ -43,18 +42,26 @@ def _cache_bytes(cache: RFSNv10KVCacheMLX) -> int:
     return mem["hot_bytes"] + mem["warm_pq_bytes"] + mem["warm_rvq_bytes"]
 
 
-def _reconstruct_hot_warm(cache: RFSNv10KVCacheMLX, quantizer: HybridQuantizerMLX) -> tuple[mx.array, mx.array]:
-    key_segments: List[mx.array] = []
-    value_segments: List[mx.array] = []
-    if cache.num_hot:
-        key_segments.append(cache.hot_keys)
-        value_segments.append(cache.hot_values)
-    if cache.num_warm:
-        key_segments.append(_decode_compressed_tensor(cache.warm_keys, quantizer))
-        value_segments.append(_decode_compressed_tensor(cache.warm_values, quantizer))
-    keys = key_segments[0] if len(key_segments) == 1 else mx.concatenate(key_segments, axis=0)
-    values = value_segments[0] if len(value_segments) == 1 else mx.concatenate(value_segments, axis=0)
-    return keys, values
+def _window_bounds(query_positions: mx.array, context_window: Optional[int]) -> Tuple[int, int, mx.array]:
+    query_np = np.asarray(query_positions, dtype=np.int64)
+    max_query = int(query_np.max())
+    window_end = max_query + 1
+    if context_window is None:
+        window_start = 0
+    else:
+        window_start = max(0, window_end - context_window)
+    adjusted = query_positions.astype(mx.int32) - window_start
+    return window_start, window_end, adjusted.astype(mx.int32)
+
+
+def _materialize_dense_window(
+    keys: mx.array,
+    values: mx.array,
+    query_positions: mx.array,
+    context_window: Optional[int],
+) -> Tuple[mx.array, mx.array, mx.array]:
+    window_start, window_end, adjusted = _window_bounds(query_positions, context_window)
+    return keys[window_start:window_end], values[window_start:window_end], adjusted
 
 
 def _score_table(q: mx.array, keys: mx.array) -> mx.array:
@@ -84,7 +91,7 @@ def _masked_score_metrics(
     }
 
 
-def _time_call(fn, repeats: int) -> tuple[float, mx.array]:
+def _time_call(fn, repeats: int) -> Tuple[float, mx.array]:
     output = fn()
     mx.eval(output)
     start = time.perf_counter()
@@ -95,57 +102,83 @@ def _time_call(fn, repeats: int) -> tuple[float, mx.array]:
     return elapsed_ms, output
 
 
-def evaluate_sequence_length(
-    seq_len: int,
-    config: RFSNConfig,
-    repeats: int,
-    query_count: int,
-) -> Dict[str, float]:
-    quantizer = HybridQuantizerMLX(config)
-    cache = RFSNv10KVCacheMLX(config, layer_idx=0)
-    keys = mx.random.normal(shape=(seq_len, config.num_heads, config.head_dim), dtype=mx.float32).astype(mx.float16)
-    values = mx.random.normal(shape=(seq_len, config.num_heads, config.head_dim), dtype=mx.float32).astype(mx.float16)
-    cache.update(keys, values, quantizer)
+def _copy_codebooks(source: HybridQuantizerMLX, target: HybridQuantizerMLX) -> None:
+    target.pq.codebooks = mx.array(np.asarray(source.pq.codebooks), dtype=mx.float16)
+    target.rvq.codebooks = mx.array(np.asarray(source.rvq.codebooks), dtype=mx.float16)
 
+
+def _build_mode_quantizers(config: RFSNConfig) -> List[Tuple[str, HybridQuantizerMLX]]:
+    pq_rvq = HybridQuantizerMLX(config)
+    pq_only = HybridQuantizerMLX(replace(config, rvq_sparsity_threshold=float("inf")))
+    _copy_codebooks(pq_rvq, pq_only)
+    return [("pq_only", pq_only), ("pq_rvq", pq_rvq)]
+
+
+def _evaluate_mode(
+    mode_name: str,
+    quantizer: HybridQuantizerMLX,
+    config: RFSNConfig,
+    keys: mx.array,
+    values: mx.array,
+    q: mx.array,
+    query_positions: mx.array,
+    repeats: int,
+    context_window: Optional[int],
+) -> Dict[str, float]:
+    cache = RFSNv10KVCacheMLX(config, layer_idx=0)
+    cache.update(keys, values, quantizer)
     if cache.num_cold:
         raise ValueError("Evaluation harness expects hot+warm only scenarios; increase warm capacity or shorten lengths")
 
-    reconstructed_keys, reconstructed_values = _reconstruct_hot_warm(cache, quantizer)
-    eval_queries = min(query_count, seq_len)
-    start_query = max(0, seq_len - eval_queries)
-    query_positions = mx.array(np.arange(start_query, seq_len, dtype=np.int32), dtype=mx.int32)
-    q = mx.random.normal(shape=(eval_queries, config.num_heads, config.head_dim), dtype=mx.float32).astype(mx.float16)
+    dense_keys, dense_values, adjusted_positions = _materialize_dense_window(
+        keys,
+        values,
+        query_positions=query_positions,
+        context_window=context_window,
+    )
+    reconstructed_keys, reconstructed_values, reconstructed_positions = cache.materialize_window(
+        query_positions=query_positions,
+        context_window=context_window,
+    )
 
     dense_fn = lambda: _blockwise_exact_attention(
         q=q,
-        keys=keys,
-        values=values,
+        keys=dense_keys,
+        values=dense_values,
         scale=config.head_dim ** -0.5,
         block_size=config.block_size_seq,
         causal=True,
-        query_positions=query_positions,
+        query_positions=adjusted_positions,
     )
     cache_fn = lambda: cache.attention_forward(
         q,
         causal=True,
         query_positions=query_positions,
+        context_window=context_window,
     )
 
     dense_latency_ms, dense_out = _time_call(dense_fn, repeats)
     cache_latency_ms, cache_out = _time_call(cache_fn, repeats)
 
     output_delta = np.asarray(dense_out.astype(mx.float32) - cache_out.astype(mx.float32), dtype=np.float32)
-    dense_scores = _score_table(q, keys)
+    dense_scores = _score_table(q, dense_keys)
     reconstructed_scores = _score_table(q, reconstructed_keys)
-    score_metrics = _masked_score_metrics(dense_scores, reconstructed_scores, query_positions)
+    score_metrics = _masked_score_metrics(dense_scores, reconstructed_scores, reconstructed_positions)
 
-    dense_bytes = _dense_bytes(config, seq_len)
+    dense_bytes = _dense_bytes(config, int(keys.shape[0]))
     cache_total_bytes = _cache_bytes(cache)
     mem = cache.memory_usage_bytes()
 
+    warm_vectors = max(cache.num_warm * config.num_heads, 1)
+    key_active = int(cache.warm_keys.rvq_codes.shape[0])
+    value_active = int(cache.warm_values.rvq_codes.shape[0])
+
     return {
-        "sequence_length": seq_len,
-        "query_count": eval_queries,
+        "sequence_length": int(keys.shape[0]),
+        "window_tokens": int(dense_keys.shape[0]),
+        "query_count": int(q.shape[0]),
+        "quantizer_mode": mode_name,
+        "rvq_enabled": 0 if mode_name == "pq_only" else 1,
         "hot_tokens": cache.num_hot,
         "warm_tokens": cache.num_warm,
         "dense_latency_ms": dense_latency_ms,
@@ -163,7 +196,52 @@ def evaluate_sequence_length(
         "hot_bytes": mem["hot_bytes"],
         "warm_pq_bytes": mem["warm_pq_bytes"],
         "warm_rvq_bytes": mem["warm_rvq_bytes"],
+        "rvq_key_active": key_active,
+        "rvq_value_active": value_active,
+        "rvq_key_active_fraction": key_active / warm_vectors,
+        "rvq_value_active_fraction": value_active / warm_vectors,
     }
+
+
+def evaluate_sequence_length(
+    seq_len: int,
+    config: RFSNConfig,
+    repeats: int,
+    query_count: int,
+    context_window: Optional[int],
+) -> List[Dict[str, float]]:
+    eval_queries = min(query_count, seq_len)
+    if context_window is not None and context_window < eval_queries:
+        raise ValueError("context_window must be at least as large as query_count")
+
+    keys = mx.random.normal(shape=(seq_len, config.num_heads, config.head_dim), dtype=mx.float32).astype(mx.float16)
+    values = mx.random.normal(shape=(seq_len, config.num_heads, config.head_dim), dtype=mx.float32).astype(mx.float16)
+    q = mx.random.normal(shape=(eval_queries, config.num_heads, config.head_dim), dtype=mx.float32).astype(mx.float16)
+    start_query = max(0, seq_len - eval_queries)
+    query_positions = mx.array(np.arange(start_query, seq_len, dtype=np.int32), dtype=mx.int32)
+
+    rows = [
+        _evaluate_mode(
+            mode_name=mode_name,
+            quantizer=quantizer,
+            config=config,
+            keys=keys,
+            values=values,
+            q=q,
+            query_positions=query_positions,
+            repeats=repeats,
+            context_window=context_window,
+        )
+        for mode_name, quantizer in _build_mode_quantizers(config)
+    ]
+
+    pq_only_row = next(row for row in rows if row["quantizer_mode"] == "pq_only")
+    for row in rows:
+        row["output_rmse_reduction_vs_pq_only"] = pq_only_row["output_rmse"] - row["output_rmse"]
+        row["score_rmse_reduction_vs_pq_only"] = pq_only_row["score_rmse"] - row["score_rmse"]
+        row["cache_latency_delta_ms_vs_pq_only"] = row["cache_latency_ms"] - pq_only_row["cache_latency_ms"]
+
+    return rows
 
 
 def run_evaluation(
@@ -173,6 +251,7 @@ def run_evaluation(
     hot_capacity: int,
     warm_capacity: Optional[int],
     output_path: Path,
+    context_window: Optional[int],
 ) -> List[Dict[str, float]]:
     if hasattr(mx.random, "seed"):
         mx.random.seed(17)
@@ -201,17 +280,31 @@ def run_evaluation(
         prefetch_throttle_s=0.0,
     )
 
-    results = [evaluate_sequence_length(seq_len, config, repeats, query_count) for seq_len in lengths]
-    output_path.parent.mkdir(parents=True, exist_ok=True)
+    results: List[Dict[str, float]] = []
+    for seq_len in lengths:
+        results.extend(
+            evaluate_sequence_length(
+                seq_len=seq_len,
+                config=config,
+                repeats=repeats,
+                query_count=query_count,
+                context_window=context_window,
+            )
+        )
 
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = [
         "sequence_length",
+        "window_tokens",
         "query_count",
+        "quantizer_mode",
+        "rvq_enabled",
         "hot_tokens",
         "warm_tokens",
         "dense_latency_ms",
         "cache_latency_ms",
         "latency_ratio",
+        "cache_latency_delta_ms_vs_pq_only",
         "dense_bytes",
         "cache_bytes",
         "memory_saved_bytes",
@@ -219,11 +312,17 @@ def run_evaluation(
         "output_mae",
         "output_rmse",
         "output_max_abs",
+        "output_rmse_reduction_vs_pq_only",
         "score_mae",
         "score_rmse",
+        "score_rmse_reduction_vs_pq_only",
         "hot_bytes",
         "warm_pq_bytes",
         "warm_rvq_bytes",
+        "rvq_key_active",
+        "rvq_value_active",
+        "rvq_key_active_fraction",
+        "rvq_value_active_fraction",
     ]
     with output_path.open("w", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
@@ -232,13 +331,15 @@ def run_evaluation(
 
     for row in results:
         logger.info(
-            "len=%3d dense=%.3fms cache=%.3fms mem=%.2fx drift=%.4f score=%.4f",
+            "len=%3d mode=%-7s window=%3d dense=%.3fms cache=%.3fms drift=%.4f score=%.4f rvq_gain=%.4f",
             row["sequence_length"],
+            row["quantizer_mode"],
+            row["window_tokens"],
             row["dense_latency_ms"],
             row["cache_latency_ms"],
-            row["compression_ratio"],
             row["output_rmse"],
             row["score_rmse"],
+            row["output_rmse_reduction_vs_pq_only"],
         )
 
     logger.info("Wrote CSV: %s", output_path)
@@ -264,6 +365,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         help="Warm-tier token capacity; defaults to max(lengths) - hot_capacity",
     )
     parser.add_argument(
+        "--context-window",
+        type=int,
+        default=64,
+        help="Attention window size for latency evaluation; use 0 for full prefix",
+    )
+    parser.add_argument(
         "--output",
         type=Path,
         default=Path("./benchmark_outputs/dense_vs_hot_warm.csv"),
@@ -278,6 +385,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         hot_capacity=args.hot_capacity,
         warm_capacity=args.warm_capacity,
         output_path=args.output,
+        context_window=args.context_window if args.context_window > 0 else None,
     )
     return 0
 
