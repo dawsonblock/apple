@@ -9,6 +9,7 @@ Quantized codebooks are capability-gated and attention is computed with a
 blockwise online-softmax pass over exact or reconstructed tensors.
 """
 
+import argparse
 import asyncio
 import logging
 import os
@@ -17,7 +18,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -294,6 +295,41 @@ def _blockwise_exact_attention(
 
     safe_sum = mx.where(running_sum > 0, running_sum, mx.ones_like(running_sum))
     return (out_accum / safe_sum[:, :, None]).astype(q.dtype)
+
+
+def _dense_exact_attention(
+    q: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    scale: float,
+    causal: bool = True,
+) -> mx.array:
+    """Exact attention for [B, S, H, D] tensors used by the decoder training path."""
+
+    q_f32 = q.astype(mx.float32)
+    k_f32 = keys.astype(mx.float32)
+    v_f32 = values.astype(mx.float32)
+    scores = mx.sum(q_f32[:, :, None, :, :] * k_f32[:, None, :, :, :], axis=-1)
+    scores = mx.transpose(scores, (0, 3, 1, 2)) * scale
+
+    if causal:
+        q_positions = mx.arange(int(q.shape[1]), dtype=mx.int32)
+        k_positions = mx.arange(int(keys.shape[1]), dtype=mx.int32)
+        mask = k_positions[None, :] <= q_positions[:, None]
+        scores = mx.where(
+            mask[None, None, :, :],
+            scores,
+            mx.full(scores.shape, MASK_FILL_VALUE, dtype=mx.float32),
+        )
+
+    probs = mx.softmax(scores, axis=-1)
+    values_by_head = mx.transpose(v_f32, (0, 2, 1, 3))
+    context = mx.sum(probs[..., None] * values_by_head[:, :, None, :, :], axis=3)
+    return mx.transpose(context, (0, 2, 1, 3)).astype(q.dtype)
+
+
+def _gelu(x: mx.array) -> mx.array:
+    return 0.5 * x * (1.0 + mx.tanh(0.7978845608 * (x + 0.044715 * (x ** 3))))
 
 
 def _compress_tensor_sequence(
@@ -634,6 +670,123 @@ class RFSNHybridAttentionMLX(nn.Module):
             causal=causal,
             query_positions=query_positions,
         )
+
+
+class RFSNDecoderLayerMLX(nn.Module):
+    """Decoder layer that owns its projections, quantizer, and cache-backed decode path."""
+
+    def __init__(self, config: RFSNConfig, layer_idx: int = 0, ffn_multiplier: int = 2):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.num_heads = config.num_heads
+        self.head_dim = config.head_dim
+        self.model_dim = config.hidden_dim
+        self.ffn_hidden_dim = max(config.hidden_dim * ffn_multiplier, config.hidden_dim)
+        self.scale = config.head_dim ** -0.5
+
+        self.attn_norm = nn.RMSNorm(config.hidden_dim)
+        self.ffn_norm = nn.RMSNorm(config.hidden_dim)
+        self.q_proj = nn.Linear(config.hidden_dim, config.num_heads * config.head_dim, bias=False)
+        self.k_proj = nn.Linear(config.hidden_dim, config.num_heads * config.head_dim, bias=False)
+        self.v_proj = nn.Linear(config.hidden_dim, config.num_heads * config.head_dim, bias=False)
+        self.o_proj = nn.Linear(config.num_heads * config.head_dim, config.hidden_dim, bias=False)
+        self.ffn_up = nn.Linear(config.hidden_dim, self.ffn_hidden_dim, bias=False)
+        self.ffn_down = nn.Linear(self.ffn_hidden_dim, config.hidden_dim, bias=False)
+
+        self.quantizer = HybridQuantizerMLX(config)
+        self.disk_cache_dir = Path(config.disk_cache_dir) / f"decoder_layer_{layer_idx}"
+        self.cache = RFSNv10KVCacheMLX(config, layer_idx=layer_idx)
+
+    @property
+    def cache_tokens(self) -> int:
+        return self.cache.total_tokens
+
+    def reset_cache(self, remove_disk: bool = True) -> None:
+        if remove_disk and self.disk_cache_dir.exists():
+            shutil.rmtree(self.disk_cache_dir)
+        self.cache = RFSNv10KVCacheMLX(self.config, layer_idx=self.layer_idx)
+
+    def prefill_cache(self, x: mx.array, reset: bool = True) -> None:
+        if len(x.shape) != 3 or int(x.shape[0]) != 1:
+            raise ValueError("prefill_cache expects input shape [1, seq_len, hidden_dim]")
+        if reset:
+            self.reset_cache(remove_disk=True)
+
+        attn_input = self.attn_norm(x).astype(mx.float16)
+        keys = self._project_heads(self.k_proj(attn_input))
+        values = self._project_heads(self.v_proj(attn_input))
+        self.cache.update(
+            keys[0].astype(mx.float16),
+            values[0].astype(mx.float16),
+            self.quantizer,
+            disk_dir=self.disk_cache_dir,
+        )
+
+    def _project_heads(self, projected: mx.array) -> mx.array:
+        batch_size, seq_len, _ = projected.shape
+        return projected.reshape(batch_size, seq_len, self.num_heads, self.head_dim).astype(mx.float16)
+
+    def _merge_heads(self, attended: mx.array) -> mx.array:
+        batch_size, seq_len, _, _ = attended.shape
+        return attended.reshape(batch_size, seq_len, self.num_heads * self.head_dim)
+
+    def __call__(
+        self,
+        x: mx.array,
+        use_cache: bool = False,
+        router: Optional["AsyncHierarchicalRouterMLX"] = None,
+        context_window: Optional[int] = None,
+    ) -> mx.array:
+        if len(x.shape) != 3:
+            raise ValueError("Decoder layer expects input shape [batch, seq_len, hidden_dim]")
+        if int(x.shape[-1]) != self.model_dim:
+            raise ValueError(f"Expected hidden_dim {self.model_dim}, got {int(x.shape[-1])}")
+
+        residual = x.astype(mx.float16)
+        attn_input = self.attn_norm(residual).astype(mx.float16)
+        q_heads = self._project_heads(self.q_proj(attn_input))
+        k_heads = self._project_heads(self.k_proj(attn_input))
+        v_heads = self._project_heads(self.v_proj(attn_input))
+
+        if use_cache:
+            if tuple(int(dim) for dim in x.shape[:2]) != (1, 1):
+                raise ValueError(
+                    "cache-backed decoding currently supports input shape [1, 1, hidden_dim]; "
+                    "use prefill_cache() for longer prompts"
+                )
+            self.cache.update(
+                k_heads[0].astype(mx.float16),
+                v_heads[0].astype(mx.float16),
+                self.quantizer,
+                disk_dir=self.disk_cache_dir,
+            )
+            query_position = mx.array([self.cache.total_tokens - 1], dtype=mx.int32)
+            effective_window = context_window
+            if effective_window is None:
+                effective_window = max(self.config.block_size_seq, min(self.cache.total_tokens, self.config.warm_capacity))
+            attended = self.cache.attention_forward(
+                q_heads[:, 0].astype(mx.float16),
+                causal=True,
+                query_positions=query_position,
+                router=router,
+                current_position=self.cache.total_tokens - 1,
+                context_window=effective_window,
+            ).reshape(1, 1, self.num_heads, self.head_dim)
+        else:
+            attended = _dense_exact_attention(
+                q=q_heads,
+                keys=k_heads,
+                values=v_heads,
+                scale=self.scale,
+                causal=True,
+            )
+
+        attn_out = self.o_proj(self._merge_heads(attended)).astype(residual.dtype)
+        hidden = residual + attn_out
+        ffn_input = self.ffn_norm(hidden).astype(mx.float16)
+        ffn_out = self.ffn_down(_gelu(self.ffn_up(ffn_input))).astype(hidden.dtype)
+        return hidden + ffn_out
 
 
 class RFSNv10KVCacheMLX:
@@ -998,6 +1151,109 @@ def calibrate_quantizer(
     return metrics
 
 
+def run_benchmarks() -> List[Dict[str, object]]:
+    benchmark_root = Path("./benchmark_rfsn_disk_cache")
+    if benchmark_root.exists():
+        shutil.rmtree(benchmark_root)
+    benchmark_root.mkdir(parents=True, exist_ok=True)
+
+    base_config = dict(
+        hidden_dim=512,
+        num_heads=4,
+        head_dim=128,
+        num_layers=2,
+        num_subspaces=8,
+        subspace_dim=16,
+        num_rvq_layers=3,
+        rvq_codebook_size=256,
+        rvq_sparsity_threshold=0.25,
+        hot_capacity=16,
+        warm_capacity=24,
+        cold_capacity=96,
+        block_size_seq=16,
+        prefetch_throttle_s=0.0,
+    )
+    scenarios = [
+        {"name": "hot_only", "tokens": 12, "iterations": 8, "use_router": False},
+        {"name": "warm_mixed", "tokens": 28, "iterations": 6, "use_router": False},
+        {"name": "cold_mixed", "tokens": 52, "iterations": 4, "use_router": True},
+    ]
+    results: List[Dict[str, object]] = []
+
+    try:
+        for scenario in scenarios:
+            cache_dir = benchmark_root / scenario["name"]
+            config = RFSNConfig(**base_config, disk_cache_dir=str(cache_dir))
+            quantizer = HybridQuantizerMLX(config)
+            cache = RFSNv10KVCacheMLX(config, layer_idx=0)
+            keys = mx.random.normal(
+                shape=(scenario["tokens"], config.num_heads, config.head_dim),
+                dtype=mx.float32,
+            ).astype(mx.float16)
+            values = mx.random.normal(
+                shape=(scenario["tokens"], config.num_heads, config.head_dim),
+                dtype=mx.float32,
+            ).astype(mx.float16)
+            cache.update(keys, values, quantizer, disk_dir=cache_dir)
+            query = mx.random.normal(shape=(1, config.num_heads, config.head_dim), dtype=mx.float32).astype(mx.float16)
+            router = AsyncHierarchicalRouterMLX(config, layer_idx=0) if scenario["use_router"] else None
+            query_positions = mx.array([scenario["tokens"] - 1], dtype=mx.int32)
+            context_window = min(scenario["tokens"], config.hot_capacity + config.warm_capacity)
+
+            warmup = cache.attention_forward(
+                query,
+                causal=True,
+                query_positions=query_positions,
+                router=router,
+                current_position=scenario["tokens"] - 1 if router is not None else None,
+                context_window=context_window if router is not None else None,
+            )
+            mx.eval(warmup)
+
+            start = time.perf_counter()
+            for _ in range(scenario["iterations"]):
+                out = cache.attention_forward(
+                    query,
+                    causal=True,
+                    query_positions=query_positions,
+                    router=router,
+                    current_position=scenario["tokens"] - 1 if router is not None else None,
+                    context_window=context_window if router is not None else None,
+                )
+                mx.eval(out)
+            mean_ms = ((time.perf_counter() - start) * 1000.0) / scenario["iterations"]
+
+            mem = cache.memory_usage_bytes()
+            cold_disk_bytes = sum(path.stat().st_size for path in cache.cold_chunk_paths if path.exists())
+            result = {
+                "scenario": scenario["name"],
+                "tokens": scenario["tokens"],
+                "iterations": scenario["iterations"],
+                "mean_latency_ms": round(mean_ms, 3),
+                "hot_bytes": mem["hot_bytes"],
+                "warm_pq_bytes": mem["warm_pq_bytes"],
+                "warm_rvq_bytes": mem["warm_rvq_bytes"],
+                "cold_tokens": mem["cold_tokens"],
+                "cold_chunks": mem["cold_chunks"],
+                "cold_disk_bytes": cold_disk_bytes,
+            }
+            results.append(result)
+            logger.info(
+                "[Bench] %-10s tokens=%d mean=%.3fms hot=%.1fKB warm=%.1fKB cold_disk=%.1fKB",
+                result["scenario"],
+                result["tokens"],
+                result["mean_latency_ms"],
+                result["hot_bytes"] / 1024.0,
+                (result["warm_pq_bytes"] + result["warm_rvq_bytes"]) / 1024.0,
+                result["cold_disk_bytes"] / 1024.0,
+            )
+    finally:
+        if benchmark_root.exists():
+            shutil.rmtree(benchmark_root)
+
+    return results
+
+
 def run_tests() -> bool:
     config = RFSNConfig(
         hidden_dim=512,
@@ -1030,7 +1286,7 @@ def run_tests() -> bool:
 
     hq = HybridQuantizerMLX(config)
     attention = RFSNHybridAttentionMLX(config)
-    tests: List[Tuple[str, callable]] = []
+    tests: List[Tuple[str, Callable[[], None]]] = []
 
     def test_pq_roundtrip() -> None:
         vectors = mx.random.normal(shape=(96, config.head_dim), dtype=mx.float32).astype(mx.float16)
@@ -1166,6 +1422,25 @@ def run_tests() -> bool:
         assert router.get_chunk(loaded_ids[0]) is not None
         logger.info("  Router prefetched chunks: %s", loaded_ids)
 
+    def test_decoder_layer_api() -> None:
+        layer = RFSNDecoderLayerMLX(config, layer_idx=0)
+        batch_input = mx.random.normal(shape=(2, 6, config.hidden_dim), dtype=mx.float32).astype(mx.float16)
+        batch_out = layer(batch_input, use_cache=False)
+        assert batch_out.shape == batch_input.shape
+
+        prompt = mx.random.normal(shape=(1, 4, config.hidden_dim), dtype=mx.float32).astype(mx.float16)
+        layer.prefill_cache(prompt)
+        assert layer.cache_tokens == 4
+
+        decode_token = mx.random.normal(shape=(1, 1, config.hidden_dim), dtype=mx.float32).astype(mx.float16)
+        decode_out = layer(decode_token, use_cache=True)
+        assert decode_out.shape == decode_token.shape
+        assert layer.cache_tokens == 5
+
+        layer.reset_cache(remove_disk=True)
+        assert layer.cache_tokens == 0
+        logger.info("  Decoder layer cache-backed path validated")
+
     tests.extend(
         [
             ("PQ roundtrip", test_pq_roundtrip),
@@ -1176,6 +1451,7 @@ def run_tests() -> bool:
             ("KV cache tiers", test_kv_cache_tiers_and_attention),
             ("Calibration", test_calibration),
             ("Async router", test_async_router),
+            ("Decoder layer API", test_decoder_layer_api),
         ]
     )
 
@@ -1203,6 +1479,21 @@ def run_tests() -> bool:
     return all_passed
 
 
+def main(argv: Optional[Sequence[str]] = None) -> int:
+    parser = argparse.ArgumentParser(description="RFSN v10.2 MLX Apple Silicon tooling")
+    parser.add_argument("--test", action="store_true", help="Run the MLX test suite")
+    parser.add_argument("--bench", action="store_true", help="Run the MLX cache benchmarks")
+    args = parser.parse_args(argv)
+
+    run_default_tests = args.test or not args.bench
+    success = True
+    if run_default_tests:
+        success = run_tests()
+    if args.bench:
+        run_benchmarks()
+    return 0 if success else 1
+
+
 if __name__ == "__main__":
     os.environ.setdefault("OMP_NUM_THREADS", "4")
     os.environ.setdefault("MKL_NUM_THREADS", "4")
@@ -1211,6 +1502,4 @@ if __name__ == "__main__":
     logger.info("RFSN v10.2 - MLX Apple Silicon implementation")
     logger.info("MLX default device: %s", mx.default_device() if hasattr(mx, "default_device") else "unknown")
 
-    ok = run_tests()
-    if not ok:
-        sys.exit(1)
+    sys.exit(main())

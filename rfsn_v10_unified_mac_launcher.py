@@ -9,6 +9,7 @@ Backend order:
   3. PyTorch on CPU
 """
 
+import argparse
 import logging
 import os
 import sys
@@ -115,17 +116,26 @@ def select_best_backend(backends: List[BackendInfo]) -> BackendInfo:
     return sorted(available, key=lambda backend: backend.priority)[0]
 
 
-def run_mlx_ane() -> None:
+def run_mlx_ane(mode: str = "test") -> None:
     try:
-        from rfsn_v10_mlx_ane_complete import run_tests
+        if mode == "bench":
+            from rfsn_v10_mlx_ane_complete import run_benchmarks
+        else:
+            from rfsn_v10_mlx_ane_complete import run_tests
     except Exception as exc:
+        if mode == "bench":
+            raise RuntimeError(f"Failed to import MLX benchmark entrypoint: {exc}") from exc
         logger.warning("Failed to import full MLX implementation (%s); using embedded smoke tests", exc)
         run_mlx_embedded_tests()
         return
 
-    logger.info("Running MLX Apple Silicon test suite")
-    if not run_tests():
-        raise RuntimeError("MLX backend tests failed")
+    if mode == "bench":
+        logger.info("Running MLX Apple Silicon benchmarks")
+        run_benchmarks()
+    else:
+        logger.info("Running MLX Apple Silicon test suite")
+        if not run_tests():
+            raise RuntimeError("MLX backend tests failed")
 
 
 def run_mlx_embedded_tests() -> None:
@@ -374,6 +384,19 @@ def run_pytorch_cpu() -> None:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="RFSN v10.2 unified launcher")
+    parser.add_argument(
+        "--bench",
+        action="store_true",
+        help="Run the MLX benchmark harness instead of the default test path",
+    )
+    parser.add_argument(
+        "--backend",
+        choices=["mlx", "mps", "cpu"],
+        help="Force a specific backend instead of auto-selecting the best available one",
+    )
+    args = parser.parse_args()
+
     os.environ.setdefault("OMP_NUM_THREADS", "4")
     os.environ.setdefault("MKL_NUM_THREADS", "4")
     os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "4")
@@ -388,11 +411,27 @@ def main() -> None:
         status = "OK" if backend.is_available else "NO"
         logger.info("  [%s] %-12s %s", status, backend.name, backend.reason)
 
-    best = select_best_backend(backends)
+    if args.backend is not None:
+        name_map = {
+            "mlx": "mlx_apple",
+            "mps": "pytorch_mps",
+            "cpu": "pytorch_cpu",
+        }
+        desired_name = name_map[args.backend]
+        matches = [backend for backend in backends if backend.name == desired_name]
+        if not matches or not matches[0].is_available:
+            raise RuntimeError(f"Requested backend '{args.backend}' is not available")
+        best = matches[0]
+    else:
+        best = select_best_backend(backends)
+
     logger.info("Selected backend: %s (%s)", best.name, best.reason)
 
+    if args.bench and best.name != "mlx_apple":
+        raise RuntimeError("Benchmark mode is only available for the MLX backend in this launcher")
+
     if best.name == "mlx_apple":
-        run_mlx_ane()
+        run_mlx_ane(mode="bench" if args.bench else "test")
     elif best.name == "pytorch_mps":
         run_pytorch_mps()
     else:
