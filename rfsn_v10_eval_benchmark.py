@@ -497,9 +497,10 @@ def run_evaluation(
 
     for row in results:
         logger.info(
-            "len=%3d profile=%-10s window=%3d mode=%-7s cache=%.3fms recon=%3d warm_decodes=%d cold_decodes=%d drift=%.4f",
+            "len=%3d profile=%-10s requested=%3d actual=%3d mode=%-7s cache=%.3fms recon=%3d warm_decodes=%d cold_decodes=%d drift=%.4f",
             row["sequence_length"],
             row["storage_profile"],
+            row["requested_context_window"],
             row["window_tokens"],
             row["quantizer_mode"],
             row["cache_latency_ms"],
