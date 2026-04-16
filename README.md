@@ -245,6 +245,7 @@ Current validation status:
 
 - The Meta Llama 3.2 path was exercised in this repo and failed at the expected external boundary: the local Hugging Face account is authenticated, but it is not on the authorized list for `meta-llama/Llama-3.2-1B-Instruct`.
 - The same adapter path was validated successfully against `TinyLlama/TinyLlama-1.1B-Chat-v1.0` on MPS, and the resulting artifacts are checked into `benchmark_outputs`.
+- An accessible Llama 3.2-family derivative, `unsloth/Llama-3.2-1B-Instruct`, was also validated successfully on MPS for both short prompts and a forced long-prompt warm-tier run.
 
 Recommended workflow for model-backed runs:
 
@@ -299,6 +300,9 @@ Important files:
 - [benchmark_outputs/dense_vs_hot_warm_router.csv](benchmark_outputs/dense_vs_hot_warm_router.csv)
 - [benchmark_outputs/tinyllama_smoke_test.json](benchmark_outputs/tinyllama_smoke_test.json)
 - [benchmark_outputs/tinyllama_layer_benchmark.csv](benchmark_outputs/tinyllama_layer_benchmark.csv)
+- [benchmark_outputs/unsloth_llama32_1b_smoke_test.json](benchmark_outputs/unsloth_llama32_1b_smoke_test.json)
+- [benchmark_outputs/unsloth_llama32_1b_layer_benchmark.csv](benchmark_outputs/unsloth_llama32_1b_layer_benchmark.csv)
+- [benchmark_outputs/unsloth_llama32_1b_long_prompt_smoke_test.json](benchmark_outputs/unsloth_llama32_1b_long_prompt_smoke_test.json)
 
 ### What The Columns Mean
 
@@ -329,6 +333,13 @@ Representative current results from the checked in TinyLlama layer-adapter artif
 - The three-prompt benchmark in `benchmark_outputs/tinyllama_layer_benchmark.csv` keeps cache last-token RMSE in a narrow band of roughly `6.97e-6` to `1.06e-5`.
 - Those TinyLlama runs are all hot-tier only: `reconstructed_tokens`, `warm_chunk_decodes`, and `cold_chunk_decodes` remain zero because the tested prompt lengths fit inside the configured hot capacity.
 - Latency in those short layer-only runs is mixed rather than uniformly better for the cache path, which is the honest expected outcome when reconstruction is not engaged and we are only measuring a single adapted decoder layer instead of whole-model serving.
+
+Representative current results from the unsloth Llama 3.2 1B artifacts:
+
+- The short-prompt smoke test in `benchmark_outputs/unsloth_llama32_1b_smoke_test.json` shows strong layer parity on MPS, with dense output RMSE about `5.33e-5`, cache last-token RMSE about `2.93e-5`, and cache-vs-dense last-token RMSE about `5.35e-6`.
+- The three-prompt benchmark in `benchmark_outputs/unsloth_llama32_1b_layer_benchmark.csv` keeps cache last-token RMSE in a narrow band of roughly `2.54e-5` to `2.94e-5`.
+- A forced long-prompt run in `benchmark_outputs/unsloth_llama32_1b_long_prompt_smoke_test.json` pushes the prompt length to `166` tokens, which exceeds the default hot capacity and causes the cache path to reconstruct `103` warm-tier tokens across `4` warm chunk decodes.
+- That long-prompt run is the clearest proof so far that the adapter is exercising real tiered-cache behavior: dense last-token RMSE stays about `1.92e-5`, while the cache path jumps to about `2.30e-2` RMSE with cache latency about `72.6 ms` versus `8.16 ms` dense, which exposes the real reconstruction penalty instead of hiding it.
 
 The takeaway is still the same: memory wins are real, drift can be reduced with RVQ, and latency remains the main systems bottleneck.
 
