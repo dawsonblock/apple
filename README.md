@@ -241,6 +241,11 @@ What it does not do:
 
 Before first use, accept the model license on Hugging Face and authenticate locally if the checkpoint requires it.
 
+Current validation status:
+
+- The Meta Llama 3.2 path was exercised in this repo and failed at the expected external boundary: the local Hugging Face account is authenticated, but it is not on the authorized list for `meta-llama/Llama-3.2-1B-Instruct`.
+- The same adapter path was validated successfully against `TinyLlama/TinyLlama-1.1B-Chat-v1.0` on MPS, and the resulting artifacts are checked into `benchmark_outputs`.
+
 Recommended workflow for model-backed runs:
 
 ```bash
@@ -317,6 +322,13 @@ Representative current results from the checked in CSVs:
 - At sequence length 64 with a 64 token hot_warm window, PQ only shows about 1.94x memory compression while PQ plus RVQ lowers output RMSE relative to PQ only.
 - At longer windows, RVQ usually reduces drift but increases latency substantially because it reconstructs more information per decoded chunk.
 - In the router focused cold mixed run at length 128 and requested window 64, the cold path now records two cold chunk cache hits and zero misses, which confirms the router is aligned with the current chunk layout.
+
+Representative current results from the checked in TinyLlama layer-adapter artifacts:
+
+- The smoke test in `benchmark_outputs/tinyllama_smoke_test.json` shows tight layer parity on MPS for layer 0, with dense output RMSE about `8.87e-6`, cache last-token RMSE about `7.80e-6`, and cache-vs-dense last-token RMSE about `2.62e-6`.
+- The three-prompt benchmark in `benchmark_outputs/tinyllama_layer_benchmark.csv` keeps cache last-token RMSE in a narrow band of roughly `6.97e-6` to `1.06e-5`.
+- Those TinyLlama runs are all hot-tier only: `reconstructed_tokens`, `warm_chunk_decodes`, and `cold_chunk_decodes` remain zero because the tested prompt lengths fit inside the configured hot capacity.
+- Latency in those short layer-only runs is mixed rather than uniformly better for the cache path, which is the honest expected outcome when reconstruction is not engaged and we are only measuring a single adapted decoder layer instead of whole-model serving.
 
 The takeaway is still the same: memory wins are real, drift can be reduced with RVQ, and latency remains the main systems bottleneck.
 
