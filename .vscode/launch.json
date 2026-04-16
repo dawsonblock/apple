@@ -6,8 +6,8 @@
       "type": "lldb",
       "request": "launch",
       "args": [],
-      "cwd": "/Users/dawsonblock/Downloads/apple/benchmark_outputs",
-      "program": "/Users/dawsonblock/Downloads/apple/benchmark_outputs/build/Debug/outDebug"
+      "cwd": "/Users/dawsonblock/Downloads/apple",
+      "program": "/Users/dawsonblock/Downloads/apple/build/Debug/outDebug"
     }
   ]
 }
