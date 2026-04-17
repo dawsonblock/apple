@@ -16,6 +16,7 @@ from llama32_adapter import (
     get_rotary_embedding_module,
     load_model_and_tokenizer,
     prepare_prompt,
+    require_min_metric,
     require_min_total_tokens,
     run_layer_parity,
 )
@@ -56,6 +57,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--context-window", type=int, default=None)
     parser.add_argument("--disable-rvq", action="store_true")
     parser.add_argument("--use-router", action="store_true")
+    parser.add_argument(
+        "--min-reconstructed-tokens",
+        type=int,
+        default=None,
+        help="Fail if the cache path reconstructs fewer tokens than this value",
+    )
+    parser.add_argument(
+        "--min-warm-chunk-decodes",
+        type=int,
+        default=None,
+        help="Fail if the cache path performs fewer warm chunk decodes than this value",
+    )
+    parser.add_argument(
+        "--min-cold-chunk-decodes",
+        type=int,
+        default=None,
+        help="Fail if the cache path performs fewer cold chunk decodes than this value",
+    )
+    parser.add_argument(
+        "--min-cold-chunk-cache-hits",
+        type=int,
+        default=None,
+        help="Fail if router-assisted cold fetches produce fewer cache hits than this value",
+    )
     parser.add_argument("--output", type=Path, default=None, help="Optional JSON output path")
     return parser
 
@@ -105,6 +130,10 @@ def main() -> None:
         context_window=args.context_window,
         use_router=args.use_router,
     )
+    require_min_metric(metrics, "reconstructed_tokens", args.min_reconstructed_tokens, label="smoke test")
+    require_min_metric(metrics, "warm_chunk_decodes", args.min_warm_chunk_decodes, label="smoke test")
+    require_min_metric(metrics, "cold_chunk_decodes", args.min_cold_chunk_decodes, label="smoke test")
+    require_min_metric(metrics, "cold_chunk_cache_hits", args.min_cold_chunk_cache_hits, label="smoke test")
 
     result: Dict[str, Any] = {
         "model_id": args.model_id,
@@ -123,6 +152,10 @@ def main() -> None:
         "capture_latency_ms": trace.capture_latency_ms,
         "min_prompt_tokens": args.min_prompt_tokens,
         "min_total_tokens": args.min_total_tokens,
+        "min_reconstructed_tokens": args.min_reconstructed_tokens,
+        "min_warm_chunk_decodes": args.min_warm_chunk_decodes,
+        "min_cold_chunk_decodes": args.min_cold_chunk_decodes,
+        "min_cold_chunk_cache_hits": args.min_cold_chunk_cache_hits,
         "context_window": args.context_window,
         "use_router": args.use_router,
         "disable_rvq": args.disable_rvq,

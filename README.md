@@ -279,6 +279,8 @@ Both optional Llama CLIs also support long-context prompt expansion:
 - `--prompt-repeat N` repeats the base prompt `N` times before capture.
 - `--min-prompt-tokens N` keeps repeating the base prompt until the tokenized prompt reaches at least `N` tokens.
 - `--min-total-tokens N` fails fast if prompt plus generated tokens still stays below the requested budget.
+- `--min-reconstructed-tokens N`, `--min-warm-chunk-decodes N`, and `--min-cold-chunk-decodes N` fail fast unless the cache path actually touches the expected compressed tiers.
+- `--min-cold-chunk-cache-hits N` lets router-enabled cold runs assert that prefetch produced real cache hits.
 - `--repeat-separator '\n\n'` lets you control how repeated prompt copies are joined.
 
 That makes warm-tier and cold-tier experiments reproducible without building ad hoc shell heredocs.
@@ -290,6 +292,8 @@ python3 rfsn_v10_llama32_smoke_test.py \
   --model-id unsloth/Llama-3.2-1B-Instruct \
   --prompt "Explain how a tiered KV cache trades memory for reconstruction latency." \
   --min-prompt-tokens 160 \
+  --min-reconstructed-tokens 1 \
+  --min-warm-chunk-decodes 1 \
   --context-window 256 \
   --output benchmark_outputs/unsloth_llama32_1b_warm_tier_smoke_test.json
 ```
@@ -300,9 +304,13 @@ Example longer router-enabled run aimed at crossing the default hot plus warm bu
 python3 rfsn_v10_llama32_smoke_test.py \
   --model-id unsloth/Llama-3.2-1B-Instruct \
   --prompt "Explain how a tiered KV cache trades memory for reconstruction latency." \
-  --min-prompt-tokens 340 \
+  --min-prompt-tokens 321 \
   --min-total-tokens 321 \
-  --context-window 512 \
+  --max-new-tokens 1 \
+  --min-reconstructed-tokens 1 \
+  --min-cold-chunk-decodes 1 \
+  --min-cold-chunk-cache-hits 1 \
+  --context-window 384 \
   --use-router \
   --output benchmark_outputs/unsloth_llama32_1b_cold_tier_smoke_test.json
 ```
@@ -336,6 +344,9 @@ Important files:
 - [benchmark_outputs/unsloth_llama32_1b_smoke_test.json](benchmark_outputs/unsloth_llama32_1b_smoke_test.json)
 - [benchmark_outputs/unsloth_llama32_1b_layer_benchmark.csv](benchmark_outputs/unsloth_llama32_1b_layer_benchmark.csv)
 - [benchmark_outputs/unsloth_llama32_1b_long_prompt_smoke_test.json](benchmark_outputs/unsloth_llama32_1b_long_prompt_smoke_test.json)
+- [benchmark_outputs/unsloth_llama32_1b_warm_tier_smoke_test.json](benchmark_outputs/unsloth_llama32_1b_warm_tier_smoke_test.json)
+- [benchmark_outputs/unsloth_llama32_1b_cold_tier_smoke_test.json](benchmark_outputs/unsloth_llama32_1b_cold_tier_smoke_test.json)
+- [benchmark_outputs/unsloth_llama32_1b_cold_tier_layer_benchmark.csv](benchmark_outputs/unsloth_llama32_1b_cold_tier_layer_benchmark.csv)
 
 ### What The Columns Mean
 
@@ -373,6 +384,9 @@ Representative current results from the unsloth Llama 3.2 1B artifacts:
 - The three-prompt benchmark in `benchmark_outputs/unsloth_llama32_1b_layer_benchmark.csv` keeps cache last-token RMSE in a narrow band of roughly `2.54e-5` to `2.94e-5`.
 - A forced long-prompt run in `benchmark_outputs/unsloth_llama32_1b_long_prompt_smoke_test.json` pushes the prompt length to `166` tokens, which exceeds the default hot capacity and causes the cache path to reconstruct `103` warm-tier tokens across `4` warm chunk decodes.
 - That long-prompt run is the clearest proof so far that the adapter is exercising real tiered-cache behavior: dense last-token RMSE stays about `1.92e-5`, while the cache path jumps to about `2.30e-2` RMSE with cache latency about `72.6 ms` versus `8.16 ms` dense, which exposes the real reconstruction penalty instead of hiding it.
+- The guarded warm-tier smoke test in `benchmark_outputs/unsloth_llama32_1b_warm_tier_smoke_test.json` uses the new assertion flags and confirms actual warm-tier work: prompt length `169`, reconstructed tokens `106`, warm chunk decodes `4`, cache latency about `58.5 ms`, and cache last-token RMSE about `2.66e-2`.
+- The guarded cold-tier smoke test in `benchmark_outputs/unsloth_llama32_1b_cold_tier_smoke_test.json` now proves the full hierarchy works on this adapter path after fixing incremental cold-chunk appends: prompt length `323`, reconstructed tokens `260`, warm chunk decodes `8`, cold chunk decodes `1`, cold chunk cache hits `1`, cache latency about `650.1 ms`, and cache last-token RMSE about `3.08e-2`.
+- The guarded three-prompt benchmark in `benchmark_outputs/unsloth_llama32_1b_cold_tier_layer_benchmark.csv` shows the same full-hierarchy behavior across all prompts, with prompt lengths from `323` to `351`, reconstructed tokens from `260` to `288`, `8` warm chunk decodes plus `1` cold chunk decode and `1` cold chunk cache hit on every row, and cache last-token RMSE roughly `3.39e-2` to `3.92e-2`.
 
 The takeaway is still the same: memory wins are real, drift can be reduced with RVQ, and latency remains the main systems bottleneck.
 

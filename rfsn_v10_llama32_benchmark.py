@@ -19,6 +19,7 @@ from llama32_adapter import (
     load_model_and_tokenizer,
     load_prompts_from_file,
     prepare_prompt,
+    require_min_metric,
     require_min_total_tokens,
     run_layer_parity,
 )
@@ -58,6 +59,30 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--context-window", type=int, default=None)
     parser.add_argument("--disable-rvq", action="store_true")
     parser.add_argument("--use-router", action="store_true")
+    parser.add_argument(
+        "--min-reconstructed-tokens",
+        type=int,
+        default=None,
+        help="Fail if the cache path reconstructs fewer tokens than this value",
+    )
+    parser.add_argument(
+        "--min-warm-chunk-decodes",
+        type=int,
+        default=None,
+        help="Fail if the cache path performs fewer warm chunk decodes than this value",
+    )
+    parser.add_argument(
+        "--min-cold-chunk-decodes",
+        type=int,
+        default=None,
+        help="Fail if the cache path performs fewer cold chunk decodes than this value",
+    )
+    parser.add_argument(
+        "--min-cold-chunk-cache-hits",
+        type=int,
+        default=None,
+        help="Fail if router-assisted cold fetches produce fewer cache hits than this value",
+    )
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--prompt", action="append", default=[], help="Repeatable prompt value")
     parser.add_argument("--prompts-file", type=Path, default=None)
@@ -126,14 +151,17 @@ def main() -> None:
 
         runs: List[Dict[str, float]] = []
         for _ in range(args.repeats):
-            runs.append(
-                run_layer_parity(
-                    adapter=adapter,
-                    trace=trace,
-                    context_window=args.context_window,
-                    use_router=args.use_router,
-                )
+            run = run_layer_parity(
+                adapter=adapter,
+                trace=trace,
+                context_window=args.context_window,
+                use_router=args.use_router,
             )
+            require_min_metric(run, "reconstructed_tokens", args.min_reconstructed_tokens, label=f"prompt {prompt_index}")
+            require_min_metric(run, "warm_chunk_decodes", args.min_warm_chunk_decodes, label=f"prompt {prompt_index}")
+            require_min_metric(run, "cold_chunk_decodes", args.min_cold_chunk_decodes, label=f"prompt {prompt_index}")
+            require_min_metric(run, "cold_chunk_cache_hits", args.min_cold_chunk_cache_hits, label=f"prompt {prompt_index}")
+            runs.append(run)
 
         baseline = dict(runs[0])
         baseline["dense_latency_ms"] = mean(run["dense_latency_ms"] for run in runs)
@@ -155,6 +183,10 @@ def main() -> None:
             "capture_latency_ms": trace.capture_latency_ms,
             "min_prompt_tokens": -1 if args.min_prompt_tokens is None else args.min_prompt_tokens,
             "min_total_tokens": -1 if args.min_total_tokens is None else args.min_total_tokens,
+            "min_reconstructed_tokens": -1 if args.min_reconstructed_tokens is None else args.min_reconstructed_tokens,
+            "min_warm_chunk_decodes": -1 if args.min_warm_chunk_decodes is None else args.min_warm_chunk_decodes,
+            "min_cold_chunk_decodes": -1 if args.min_cold_chunk_decodes is None else args.min_cold_chunk_decodes,
+            "min_cold_chunk_cache_hits": -1 if args.min_cold_chunk_cache_hits is None else args.min_cold_chunk_cache_hits,
             "context_window": -1 if args.context_window is None else args.context_window,
             "use_router": int(args.use_router),
             "disable_rvq": int(args.disable_rvq),

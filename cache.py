@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import mlx.core as mx
 import numpy as np
@@ -147,25 +147,46 @@ class RFSNv10KVCacheMLX:
             end = min(offset + chunk_tokens, int(keys.shape[0]))
             chunk_keys = keys[offset:end]
             chunk_values = values[offset:end]
+            chunk_len = int(chunk_keys.shape[0])
             chunk_start_token = start_token + offset
             chunk_id = chunk_start_token // chunk_tokens
             chunk_path = chunk_file_path(disk_root, self.layer_idx, chunk_id)
 
             compressed_keys = _compress_tensor_sequence(chunk_keys, quantizer)
             compressed_values = _compress_tensor_sequence(chunk_values, quantizer)
-            save_compressed_chunk(chunk_path, compressed_keys, compressed_values)
-
-            self.cold_chunk_paths.append(chunk_path)
-            self.cold_chunk_paths_by_id[chunk_id] = chunk_path
-            self.cold_chunk_metadata.append(
-                {
-                    "chunk_id": chunk_id,
-                    "start_token": chunk_start_token,
-                    "end_token": chunk_start_token + int(chunk_keys.shape[0]),
-                    "num_tokens": int(chunk_keys.shape[0]),
-                    "path": str(chunk_path),
-                }
-            )
+            existing_metadata = next((item for item in self.cold_chunk_metadata if item["chunk_id"] == chunk_id), None)
+            if existing_metadata is not None and chunk_id in self.cold_chunk_paths_by_id:
+                if chunk_start_token != existing_metadata["end_token"]:
+                    raise ValueError(
+                        "Cold chunk append must be contiguous with existing metadata: "
+                        f"chunk_id={chunk_id} start={chunk_start_token} expected={existing_metadata['end_token']}"
+                    )
+                loaded = load_compressed_chunk(self.cold_chunk_paths_by_id[chunk_id])
+                merged_keys = _append_compressed_tensor(
+                    compressed_tensor_from_loaded(loaded, "key"),
+                    compressed_keys,
+                )
+                merged_values = _append_compressed_tensor(
+                    compressed_tensor_from_loaded(loaded, "value"),
+                    compressed_values,
+                )
+                save_compressed_chunk(chunk_path, merged_keys, merged_values)
+                existing_metadata["end_token"] += chunk_len
+                existing_metadata["num_tokens"] += chunk_len
+                existing_metadata["path"] = str(chunk_path)
+            else:
+                save_compressed_chunk(chunk_path, compressed_keys, compressed_values)
+                self.cold_chunk_paths.append(chunk_path)
+                self.cold_chunk_paths_by_id[chunk_id] = chunk_path
+                self.cold_chunk_metadata.append(
+                    {
+                        "chunk_id": chunk_id,
+                        "start_token": chunk_start_token,
+                        "end_token": chunk_start_token + chunk_len,
+                        "num_tokens": chunk_len,
+                        "path": str(chunk_path),
+                    }
+                )
 
         self.num_cold += int(keys.shape[0])
 
@@ -192,8 +213,15 @@ class RFSNv10KVCacheMLX:
         context_window: Optional[int],
         current_position: Optional[int],
     ) -> Tuple[int, int, Optional[mx.array]]:
+        def to_query_array(value: Optional[Any]) -> Optional[mx.array]:
+            if value is None:
+                return None
+            if hasattr(value, "astype"):
+                return value.astype(mx.int32)
+            return mx.array(value, dtype=mx.int32)
+
         if self.total_tokens == 0:
-            return 0, 0, query_positions.astype(mx.int32) if hasattr(query_positions, "astype") else query_positions
+            return 0, 0, to_query_array(query_positions)
 
         max_query = self._max_query_position(query_positions, current_position)
         window_end = min(max_query + 1, self.total_tokens)
@@ -205,7 +233,9 @@ class RFSNv10KVCacheMLX:
         if query_positions is None:
             return window_start, window_end, None
 
-        adjusted = query_positions.astype(mx.int32) if hasattr(query_positions, "astype") else mx.array(query_positions, dtype=mx.int32)
+        adjusted = to_query_array(query_positions)
+        if adjusted is None:
+            return window_start, window_end, None
         adjusted = adjusted - window_start
         adjusted = mx.maximum(adjusted, mx.full(adjusted.shape, -1, dtype=mx.int32))
         return window_start, window_end, adjusted.astype(mx.int32)

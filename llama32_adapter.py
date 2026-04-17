@@ -124,6 +124,27 @@ def require_min_total_tokens(trace: LayerTrace, min_total_tokens: Optional[int],
     )
 
 
+def require_min_metric(
+    metrics: Dict[str, float],
+    metric_name: str,
+    minimum_value: Optional[float],
+    label: str = "run",
+) -> None:
+    if minimum_value is None:
+        return
+    if minimum_value < 0:
+        raise ValueError(f"{metric_name} minimum must be non-negative when provided")
+    if metric_name not in metrics:
+        raise KeyError(f"Metric {metric_name!r} is not available in the recorded run metrics")
+    observed_value = float(metrics[metric_name])
+    if observed_value >= minimum_value:
+        return
+    raise RuntimeError(
+        f"{label} recorded {metric_name}={observed_value:.3f}, below the required minimum of {minimum_value}. "
+        "Increase the prompt budget or widen the context window so the requested tier work actually occurs."
+    )
+
+
 def resolve_torch_device(requested: str) -> torch.device:
     choice = requested.lower()
     if choice == "auto":
@@ -280,9 +301,12 @@ def capture_layer_trace(
         layer_output = output[0] if isinstance(output, tuple) else output
         position_ids = kwargs.get("position_ids")
         position_embeddings = kwargs.get("position_embeddings")
+        captured_position_ids: Optional[torch.Tensor] = None
+        if isinstance(position_ids, torch.Tensor):
+            captured_position_ids = position_ids.detach().cpu()
         capture["input_hidden_states"] = hidden_states.detach().cpu()
         capture["output_hidden_states"] = layer_output.detach().cpu()
-        capture["position_ids"] = position_ids.detach().cpu() if isinstance(position_ids, torch.Tensor) else None
+        capture["position_ids"] = captured_position_ids
         if (
             isinstance(position_embeddings, (tuple, list))
             and len(position_embeddings) == 2
@@ -505,9 +529,10 @@ class Llama32DecoderLayerMLX:
             raise RuntimeError(
                 "No position embeddings were captured and no rotary embedding module is available to recompute them."
             )
-        if position_ids is None:
-            position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
-        rotary_device = position_ids.device
+        resolved_position_ids = position_ids
+        if resolved_position_ids is None:
+            resolved_position_ids = torch.arange(seq_len, dtype=torch.long).unsqueeze(0)
+        rotary_device = resolved_position_ids.device
         rotary_buffer = next(self.rotary_module.buffers(), None)
         if rotary_buffer is not None:
             rotary_device = rotary_buffer.device
@@ -515,13 +540,13 @@ class Llama32DecoderLayerMLX:
             rotary_param = next(self.rotary_module.parameters(), None)
             if rotary_param is not None:
                 rotary_device = rotary_param.device
-        position_ids = position_ids.to(rotary_device)
+        resolved_position_ids = resolved_position_ids.to(rotary_device)
         rotary_hidden = torch.zeros((1, seq_len, self.hidden_dim), dtype=torch.float32, device=rotary_device)
         with torch.no_grad():
             try:
-                cos, sin = self.rotary_module(rotary_hidden, position_ids)
+                cos, sin = self.rotary_module(rotary_hidden, resolved_position_ids)
             except TypeError:
-                cos, sin = self.rotary_module(position_ids)
+                cos, sin = self.rotary_module(resolved_position_ids)
         return (
             _normalize_position_component(cos, seq_len, self.head_dim),
             _normalize_position_component(sin, seq_len, self.head_dim),
