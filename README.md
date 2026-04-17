@@ -274,6 +274,39 @@ python3 rfsn_v10_llama32_benchmark.py \
   --output benchmark_outputs/llama32_layer_benchmark.csv
 ```
 
+Both optional Llama CLIs also support long-context prompt expansion:
+
+- `--prompt-repeat N` repeats the base prompt `N` times before capture.
+- `--min-prompt-tokens N` keeps repeating the base prompt until the tokenized prompt reaches at least `N` tokens.
+- `--min-total-tokens N` fails fast if prompt plus generated tokens still stays below the requested budget.
+- `--repeat-separator '\n\n'` lets you control how repeated prompt copies are joined.
+
+That makes warm-tier and cold-tier experiments reproducible without building ad hoc shell heredocs.
+
+Example warm-tier smoke run with an accessible open checkpoint:
+
+```bash
+python3 rfsn_v10_llama32_smoke_test.py \
+  --model-id unsloth/Llama-3.2-1B-Instruct \
+  --prompt "Explain how a tiered KV cache trades memory for reconstruction latency." \
+  --min-prompt-tokens 160 \
+  --context-window 256 \
+  --output benchmark_outputs/unsloth_llama32_1b_warm_tier_smoke_test.json
+```
+
+Example longer router-enabled run aimed at crossing the default hot plus warm budget:
+
+```bash
+python3 rfsn_v10_llama32_smoke_test.py \
+  --model-id unsloth/Llama-3.2-1B-Instruct \
+  --prompt "Explain how a tiered KV cache trades memory for reconstruction latency." \
+  --min-prompt-tokens 340 \
+  --min-total-tokens 321 \
+  --context-window 512 \
+  --use-router \
+  --output benchmark_outputs/unsloth_llama32_1b_cold_tier_smoke_test.json
+```
+
 If Meta access is not yet approved for your Hugging Face account, an open Llama-family fallback that exercises the same code path is:
 
 ```bash

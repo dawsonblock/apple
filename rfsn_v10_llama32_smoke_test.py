@@ -7,12 +7,16 @@ from typing import Any, Dict
 
 from llama32_adapter import (
     DEFAULT_MODEL_ID,
+    DEFAULT_REPEAT_SEPARATOR,
     Llama32DecoderLayerMLX,
     build_rfsn_config_from_hf_config,
     capture_layer_trace,
+    decode_escape_sequences,
     get_decoder_layers,
     get_rotary_embedding_module,
     load_model_and_tokenizer,
+    prepare_prompt,
+    require_min_total_tokens,
     run_layer_parity,
 )
 
@@ -23,6 +27,24 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID, help="Hugging Face model id to load")
     parser.add_argument("--prompt", default="Explain why cache compression trades memory for latency.")
+    parser.add_argument("--prompt-repeat", type=int, default=1, help="Repeat the prompt this many times before capture")
+    parser.add_argument(
+        "--repeat-separator",
+        default=DEFAULT_REPEAT_SEPARATOR.encode("unicode_escape").decode("ascii"),
+        help="Separator inserted between repeated prompt copies; escape sequences like \\n are decoded",
+    )
+    parser.add_argument(
+        "--min-prompt-tokens",
+        type=int,
+        default=None,
+        help="Keep repeating the prompt until its tokenized length reaches at least this value",
+    )
+    parser.add_argument(
+        "--min-total-tokens",
+        type=int,
+        default=None,
+        help="Fail if prompt plus generated tokens stays below this value",
+    )
     parser.add_argument("--layer-index", type=int, default=0)
     parser.add_argument("--max-new-tokens", type=int, default=16)
     parser.add_argument("--device", choices=["auto", "mps", "cpu"], default="auto")
@@ -45,13 +67,21 @@ def main() -> None:
         device=args.device,
         torch_dtype=args.torch_dtype,
     )
+    prepared_prompt = prepare_prompt(
+        prompt=args.prompt,
+        tokenizer=tokenizer,
+        repeat_count=args.prompt_repeat,
+        min_prompt_tokens=args.min_prompt_tokens,
+        repeat_separator=decode_escape_sequences(args.repeat_separator),
+    )
     trace = capture_layer_trace(
         model=model,
         tokenizer=tokenizer,
-        prompt=args.prompt,
+        prompt=prepared_prompt.prompt_text,
         layer_index=args.layer_index,
         max_new_tokens=args.max_new_tokens,
     )
+    require_min_total_tokens(trace, args.min_total_tokens)
     layers = get_decoder_layers(model)
     hf_layer = layers[args.layer_index]
     adapter_config = build_rfsn_config_from_hf_config(
@@ -81,12 +111,18 @@ def main() -> None:
         "layer_index": args.layer_index,
         "device": str(resolved_device),
         "torch_dtype": str(resolved_dtype),
-        "prompt": args.prompt,
+        "source_prompt": prepared_prompt.source_prompt,
+        "prompt": prepared_prompt.prompt_text,
+        "source_prompt_tokens": prepared_prompt.source_prompt_tokens,
+        "prepared_prompt_tokens": prepared_prompt.prompt_tokens,
+        "prompt_repeat_count": prepared_prompt.repeat_count,
         "prompt_length": trace.prompt_length,
         "generated_length": trace.generated_length,
         "generated_text": trace.generated_text,
         "generation_latency_ms": trace.generation_latency_ms,
         "capture_latency_ms": trace.capture_latency_ms,
+        "min_prompt_tokens": args.min_prompt_tokens,
+        "min_total_tokens": args.min_total_tokens,
         "context_window": args.context_window,
         "use_router": args.use_router,
         "disable_rvq": args.disable_rvq,

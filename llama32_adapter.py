@@ -18,6 +18,7 @@ from storage import AsyncHierarchicalRouterMLX, RFSNConfig
 
 
 DEFAULT_MODEL_ID = "meta-llama/Llama-3.2-1B-Instruct"
+DEFAULT_REPEAT_SEPARATOR = "\n\n"
 DEFAULT_PROMPTS = [
     "Summarize why tiered KV caches are useful on memory-constrained hardware in two sentences.",
     "Write a Python function that merges two sorted lists into one sorted list.",
@@ -44,6 +45,15 @@ class LayerTrace:
         return int(self.input_ids.shape[-1])
 
 
+@dataclass
+class PreparedPrompt:
+    source_prompt: str
+    prompt_text: str
+    source_prompt_tokens: int
+    prompt_tokens: int
+    repeat_count: int
+
+
 def _require_transformers() -> Tuple[Any, Any]:
     try:
         from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -52,6 +62,66 @@ def _require_transformers() -> Tuple[Any, Any]:
             "Install optional model dependencies with `python3 -m pip install -r requirements-models-optional.txt` before using the Llama adapter."
         ) from exc
     return AutoModelForCausalLM, AutoTokenizer
+
+
+def decode_escape_sequences(value: str) -> str:
+    return value.encode("utf-8").decode("unicode_escape")
+
+
+def count_prompt_tokens(tokenizer: Any, prompt: str) -> int:
+    encoded = tokenizer(prompt, return_tensors="pt")
+    return int(encoded["input_ids"].shape[-1])
+
+
+def prepare_prompt(
+    prompt: str,
+    tokenizer: Any,
+    repeat_count: int = 1,
+    min_prompt_tokens: Optional[int] = None,
+    repeat_separator: str = DEFAULT_REPEAT_SEPARATOR,
+) -> PreparedPrompt:
+    if repeat_count < 1:
+        raise ValueError("repeat_count must be at least 1")
+    if min_prompt_tokens is not None and min_prompt_tokens < 1:
+        raise ValueError("min_prompt_tokens must be at least 1 when provided")
+
+    source_prompt_tokens = count_prompt_tokens(tokenizer, prompt)
+    prompt_parts = [prompt] * repeat_count
+    prompt_text = repeat_separator.join(prompt_parts)
+    prompt_tokens = count_prompt_tokens(tokenizer, prompt_text)
+    effective_repeat_count = repeat_count
+
+    while min_prompt_tokens is not None and prompt_tokens < min_prompt_tokens:
+        prompt_parts.append(prompt)
+        prompt_text = repeat_separator.join(prompt_parts)
+        updated_prompt_tokens = count_prompt_tokens(tokenizer, prompt_text)
+        if updated_prompt_tokens <= prompt_tokens:
+            raise RuntimeError(
+                "Prompt expansion stalled without increasing token count. Use a different base prompt or separator."
+            )
+        prompt_tokens = updated_prompt_tokens
+        effective_repeat_count += 1
+
+    return PreparedPrompt(
+        source_prompt=prompt,
+        prompt_text=prompt_text,
+        source_prompt_tokens=source_prompt_tokens,
+        prompt_tokens=prompt_tokens,
+        repeat_count=effective_repeat_count,
+    )
+
+
+def require_min_total_tokens(trace: LayerTrace, min_total_tokens: Optional[int], label: str = "prompt") -> None:
+    if min_total_tokens is None:
+        return
+    if min_total_tokens < 1:
+        raise ValueError("min_total_tokens must be at least 1 when provided")
+    if trace.total_tokens >= min_total_tokens:
+        return
+    raise RuntimeError(
+        f"{label} produced {trace.total_tokens} total tokens, below the required minimum of {min_total_tokens}. "
+        "Increase --prompt-repeat, raise --max-new-tokens, or set --min-prompt-tokens higher."
+    )
 
 
 def resolve_torch_device(requested: str) -> torch.device:

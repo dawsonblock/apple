@@ -9,13 +9,17 @@ from typing import Dict, List
 from llama32_adapter import (
     DEFAULT_MODEL_ID,
     DEFAULT_PROMPTS,
+    DEFAULT_REPEAT_SEPARATOR,
     Llama32DecoderLayerMLX,
     build_rfsn_config_from_hf_config,
     capture_layer_trace,
+    decode_escape_sequences,
     get_decoder_layers,
     get_rotary_embedding_module,
     load_model_and_tokenizer,
     load_prompts_from_file,
+    prepare_prompt,
+    require_min_total_tokens,
     run_layer_parity,
 )
 
@@ -27,6 +31,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--model-id", default=DEFAULT_MODEL_ID, help="Hugging Face model id to load")
     parser.add_argument("--layer-index", type=int, default=0)
     parser.add_argument("--max-new-tokens", type=int, default=16)
+    parser.add_argument("--prompt-repeat", type=int, default=1, help="Repeat each prompt this many times before capture")
+    parser.add_argument(
+        "--repeat-separator",
+        default=DEFAULT_REPEAT_SEPARATOR.encode("unicode_escape").decode("ascii"),
+        help="Separator inserted between repeated prompt copies; escape sequences like \\n are decoded",
+    )
+    parser.add_argument(
+        "--min-prompt-tokens",
+        type=int,
+        default=None,
+        help="Keep repeating each prompt until its tokenized length reaches at least this value",
+    )
+    parser.add_argument(
+        "--min-total-tokens",
+        type=int,
+        default=None,
+        help="Fail if a prompt plus generated tokens stays below this value",
+    )
     parser.add_argument("--device", choices=["auto", "mps", "cpu"], default="auto")
     parser.add_argument("--torch-dtype", choices=["auto", "float16", "float32", "bfloat16"], default="auto")
     parser.add_argument("--hot-capacity", type=int, default=64)
@@ -65,6 +87,7 @@ def main() -> None:
         device=args.device,
         torch_dtype=args.torch_dtype,
     )
+    repeat_separator = decode_escape_sequences(args.repeat_separator)
     layers = get_decoder_layers(model)
     hf_layer = layers[args.layer_index]
     adapter_config = build_rfsn_config_from_hf_config(
@@ -85,13 +108,21 @@ def main() -> None:
 
     rows: List[Dict[str, object]] = []
     for prompt_index, prompt in enumerate(prompts):
+        prepared_prompt = prepare_prompt(
+            prompt=prompt,
+            tokenizer=tokenizer,
+            repeat_count=args.prompt_repeat,
+            min_prompt_tokens=args.min_prompt_tokens,
+            repeat_separator=repeat_separator,
+        )
         trace = capture_layer_trace(
             model=model,
             tokenizer=tokenizer,
-            prompt=prompt,
+            prompt=prepared_prompt.prompt_text,
             layer_index=args.layer_index,
             max_new_tokens=args.max_new_tokens,
         )
+        require_min_total_tokens(trace, args.min_total_tokens, label=f"prompt {prompt_index}")
 
         runs: List[Dict[str, float]] = []
         for _ in range(args.repeats):
@@ -109,16 +140,21 @@ def main() -> None:
         baseline["cache_latency_ms"] = mean(run["cache_latency_ms"] for run in runs)
         row: Dict[str, object] = {
             "prompt_index": prompt_index,
-            "prompt_preview": prompt.replace("\n", " ")[:96],
+            "source_prompt_preview": prepared_prompt.source_prompt.replace("\n", " ")[:96],
+            "prompt_preview": prepared_prompt.prompt_text.replace("\n", " ")[:96],
             "model_id": args.model_id,
             "layer_index": args.layer_index,
             "device": str(resolved_device),
             "torch_dtype": str(resolved_dtype),
+            "source_prompt_tokens": prepared_prompt.source_prompt_tokens,
             "prompt_length": trace.prompt_length,
+            "prompt_repeat_count": prepared_prompt.repeat_count,
             "generated_length": trace.generated_length,
             "total_tokens": trace.total_tokens,
             "generation_latency_ms": trace.generation_latency_ms,
             "capture_latency_ms": trace.capture_latency_ms,
+            "min_prompt_tokens": -1 if args.min_prompt_tokens is None else args.min_prompt_tokens,
+            "min_total_tokens": -1 if args.min_total_tokens is None else args.min_total_tokens,
             "context_window": -1 if args.context_window is None else args.context_window,
             "use_router": int(args.use_router),
             "disable_rvq": int(args.disable_rvq),
@@ -129,6 +165,7 @@ def main() -> None:
             f"prompt {prompt_index}: total_tokens={trace.total_tokens} "
             f"dense_latency_ms={row['dense_latency_ms']:.3f} "
             f"cache_latency_ms={row['cache_latency_ms']:.3f} "
+            f"prompt_repeat_count={prepared_prompt.repeat_count} "
             f"cache_last_token_rmse={row['cache_last_token_rmse']:.6f}"
         )
 
